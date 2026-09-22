@@ -112,7 +112,7 @@ class TXCommandClient(DatagramProtocol):
         CMD_SET_FEC: lambda x: None,
         CMD_SET_RADIO: lambda x: None,
         CMD_GET_FEC: lambda x: struct.unpack('!BB', x),
-        CMD_GET_RADIO: lambda x: struct.unpack('!B??BB?B', x)
+        CMD_GET_RADIO: lambda x: struct.unpack('!B??BB?BB', x)
     }
 
     def __init__(self, tx_addr):
@@ -151,12 +151,12 @@ class TXCommandClient(DatagramProtocol):
                    .addCallback(_got_response)
 
     @gen_req_id
-    def set_radio(self, req_id, stbc, ldpc, short_gi, bandwidth, mcs_index, vht_mode, vht_nss):
+    def set_radio(self, req_id, stbc, ldpc, short_gi, bandwidth, mcs_index, vht_mode, vht_nss, subch=0):
         def _got_response(data):
             return None
 
-        return self._do_cmd(req_id, struct.pack('!IBB??BB?B', req_id, self.CMD_SET_RADIO,
-                                                stbc, ldpc, short_gi, bandwidth, mcs_index, vht_mode, vht_nss))\
+        return self._do_cmd(req_id, struct.pack('!IBB??BB?BB', req_id, self.CMD_SET_RADIO,
+                                                stbc, ldpc, short_gi, bandwidth, mcs_index, vht_mode, vht_nss, subch))\
                    .addCallback(_got_response)
 
     @gen_req_id
@@ -170,7 +170,7 @@ class TXCommandClient(DatagramProtocol):
     @gen_req_id
     def get_radio(self, req_id):
         def _got_response(data):
-            return dict(zip(('stbc', 'ldpc', 'short_gi', 'bandwidth', 'mcs_index', 'vht_mode', 'vht_nss'),
+            return dict(zip(('stbc', 'ldpc', 'short_gi', 'bandwidth', 'mcs_index', 'vht_mode', 'vht_nss', 'subch'),
                             self.resp_map[self.CMD_GET_RADIO](data)))
 
         return self._do_cmd(req_id, struct.pack('!IB', req_id, self.CMD_GET_RADIO))\
@@ -408,8 +408,9 @@ class TXRXTestCase(unittest.TestCase):
         self.assertEqual(res['mcs_index'], 0)
         self.assertEqual(res['vht_mode'], False)
         self.assertEqual(res['vht_nss'], 0)
+        self.assertEqual(res['subch'], 0)
 
-        yield self.cmdp.set_radio(stbc=1, ldpc=True, short_gi=False, bandwidth=40, mcs_index=3, vht_mode=False, vht_nss=0)
+        yield self.cmdp.set_radio(stbc=1, ldpc=True, short_gi=False, bandwidth=40, mcs_index=3, vht_mode=False, vht_nss=0, subch=3)
 
         res = yield self.cmdp.get_radio()
         self.assertEqual(res['stbc'], 1)
@@ -419,6 +420,7 @@ class TXRXTestCase(unittest.TestCase):
         self.assertEqual(res['mcs_index'], 3)
         self.assertEqual(res['vht_mode'], False)
         self.assertEqual(res['vht_nss'], 0)
+        self.assertEqual(res['subch'], 3)
 
         self.txp.send_msg(b'm%d' % (7,))
         yield df_sleep(0.1)
@@ -444,6 +446,13 @@ class TXRXTestCase(unittest.TestCase):
 
         try:
             yield self.cmdp.set_radio(stbc=200, ldpc=True, short_gi=False, bandwidth=1, mcs_index=100, vht_mode=False, vht_nss=0)
+            self.fail('Should fail')
+        except OSError as v:
+            self.assertEqual(str(v), 'Error: EINVAL')
+
+        try:
+            # a quarter of 80 MHz does not fit into a 20 MHz channel
+            yield self.cmdp.set_radio(stbc=0, ldpc=False, short_gi=False, bandwidth=20, mcs_index=1, vht_mode=True, vht_nss=1, subch=8)
             self.fail('Should fail')
         except OSError as v:
             self.assertEqual(str(v), 'Error: EINVAL')

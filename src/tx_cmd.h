@@ -42,6 +42,7 @@ typedef struct {
             uint8_t mcs_index;
             bool vht_mode;
             uint8_t vht_nss;
+            uint8_t subch;
         } __attribute__ ((packed)) cmd_set_radio;
     } __attribute__ ((packed)) u;
 } __attribute__ ((packed)) cmd_req_t;
@@ -66,6 +67,7 @@ typedef struct {
             uint8_t mcs_index;
             bool vht_mode;
             uint8_t vht_nss;
+            uint8_t subch;
         } __attribute__ ((packed)) cmd_get_radio;
     } __attribute__ ((packed)) u;
 } __attribute__ ((packed)) cmd_resp_t;

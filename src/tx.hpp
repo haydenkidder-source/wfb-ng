@@ -41,28 +41,6 @@ typedef struct {
 } tags_item_t;
 
 
-typedef struct {
-    std::vector<uint8_t> header;
-
-    // header info
-    uint8_t stbc;
-    bool ldpc;
-    bool short_gi;
-    uint8_t bandwidth;
-    uint8_t mcs_index;
-    bool vht_mode;
-    uint8_t vht_nss;
-} radiotap_header_t;
-
-
-radiotap_header_t init_radiotap_header(uint8_t stbc,
-                                       bool ldpc,
-                                       bool short_gi,
-                                       uint8_t bandwidth,
-                                       uint8_t mcs_index,
-                                       bool vht_mode,
-                                       uint8_t vht_nss);
-
 typedef enum {
     LOCAL,
     INJECTOR,

@@ -77,6 +77,16 @@ extern std::string string_format(const char *format, ...);
 #define IEEE80211_RADIOTAP_VHT_BW_160M      0x0B
 #define IEEE80211_RADIOTAP_VHT_CODING_LDPC_USER0    0x01
 
+// 20 MHz sub-channel of a wider channel: radiotap bandwidth code, taken by
+// the 8812eu driver from the MCS field (2, 3) or the VHT field (all)
+#define SUBCH_NONE  0    // whole channel
+#define SUBCH_20L   2    // halves of 40 MHz
+#define SUBCH_20U   3
+#define SUBCH_20LL  7    // quarters of 80 MHz, lowest first
+#define SUBCH_20LU  8
+#define SUBCH_20UL  9
+#define SUBCH_20UU  10
+
 
 #define MCS_KNOWN (IEEE80211_RADIOTAP_MCS_HAVE_MCS | IEEE80211_RADIOTAP_MCS_HAVE_BW | IEEE80211_RADIOTAP_MCS_HAVE_GI | IEEE80211_RADIOTAP_MCS_HAVE_STBC | IEEE80211_RADIOTAP_MCS_HAVE_FEC)
 
@@ -138,6 +148,29 @@ static const uint8_t radiotap_header_vht[]  __attribute__((unused)) = {
 #define VHT_BW_OFF 13
 #define VHT_MCSNSS0_OFF 14
 #define VHT_CODING_OFF 18
+
+typedef struct {
+    std::vector<uint8_t> header;
+
+    // header info
+    uint8_t stbc;
+    bool ldpc;
+    bool short_gi;
+    uint8_t bandwidth;
+    uint8_t mcs_index;
+    bool vht_mode;
+    uint8_t vht_nss;
+    uint8_t subch;
+} radiotap_header_t;
+
+radiotap_header_t init_radiotap_header(uint8_t stbc,
+                                       bool ldpc,
+                                       bool short_gi,
+                                       uint8_t bandwidth,
+                                       uint8_t mcs_index,
+                                       bool vht_mode,
+                                       uint8_t vht_nss,
+                                       uint8_t subch = SUBCH_NONE);
 
 //the last four bytes used for channel_id
 #define SRC_MAC_THIRD_BYTE 12

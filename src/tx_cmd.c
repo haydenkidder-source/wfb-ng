@@ -161,11 +161,12 @@ int set_radio(char *progname, int port, int argc, char **argv)
     int ldpc = 0;
     int mcs_index = 1;
     int vht_nss = 1;
+    int subch = 0;
     bool vht_mode = false;
     cmd_req_t req = { .req_id = htonl(rand()), .cmd_id = CMD_SET_RADIO };
     cmd_resp_t resp;
 
-    while ((opt = getopt(argc, argv, "B:G:S:L:M:N:Vh")) != -1)
+    while ((opt = getopt(argc, argv, "B:G:S:L:M:N:b:Vh")) != -1)
     {
         switch (opt)
         {
@@ -197,15 +198,20 @@ int set_radio(char *progname, int port, int argc, char **argv)
             vht_nss = atoi(optarg);
             break;
 
+        case 'b':
+            subch = atoi(optarg);
+            break;
+
         case 'V':
             vht_mode = true;
             break;
 
         default: /* '?' */
-            fprintf(stderr, "Usage: %s <port> %s [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS] [-V]\n",
+            fprintf(stderr, "Usage: %s <port> %s [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS] [-b subch] [-V]\n",
                     progname, argv[0]);
-            fprintf(stderr, "Default: bandwidth=%d, guard_interval=%s, stbc=%d, ldpc=%d, mcs_index=%d, vht_nss=%d, vht_mode=%d\n",
-                    bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode);
+            fprintf(stderr, "Default: bandwidth=%d, guard_interval=%s, stbc=%d, ldpc=%d, mcs_index=%d, vht_nss=%d, vht_mode=%d, subch=%d\n",
+                    bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, subch);
+            fprintf(stderr, "Sub-channel: 0 - whole channel, 2/3 - 20 MHz halves of 40, 7..10 - 20 MHz quarters of 80 (lowest first)\n");
             fprintf(stderr, "WFB-ng version %s\n", WFB_VERSION);
             fprintf(stderr, "WFB-ng home page: <http://wfb-ng.org>\n");
             return 1;
@@ -219,6 +225,7 @@ int set_radio(char *progname, int port, int argc, char **argv)
     req.u.cmd_set_radio.mcs_index = mcs_index;
     req.u.cmd_set_radio.vht_mode = vht_mode;
     req.u.cmd_set_radio.vht_nss = vht_nss;
+    req.u.cmd_set_radio.subch = subch;
 
     return send_command(port, req, offsetof(cmd_req_t, u) + sizeof(req.u.cmd_set_radio), &resp);
 }
@@ -256,14 +263,16 @@ int get_radio(char *progname, int port, int argc, char **argv)
                "bandwidth=%d\n"
                "mcs_index=%d\n"
                "vht_mode=%d\n"
-               "vht_nss=%d\n",
+               "vht_nss=%d\n"
+               "subch=%d\n",
                resp.u.cmd_get_radio.stbc,
                resp.u.cmd_get_radio.ldpc,
                resp.u.cmd_get_radio.short_gi,
                resp.u.cmd_get_radio.bandwidth,
                resp.u.cmd_get_radio.mcs_index,
                resp.u.cmd_get_radio.vht_mode,
-               resp.u.cmd_get_radio.vht_nss);
+               resp.u.cmd_get_radio.vht_nss,
+               resp.u.cmd_get_radio.subch);
     }
     return rc;
 }

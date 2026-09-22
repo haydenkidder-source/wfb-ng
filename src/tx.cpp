@@ -903,7 +903,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                                                                     req.u.cmd_set_radio.bandwidth,
                                                                     req.u.cmd_set_radio.mcs_index,
                                                                     req.u.cmd_set_radio.vht_mode,
-                                                                    req.u.cmd_set_radio.vht_nss);
+                                                                    req.u.cmd_set_radio.vht_nss,
+                                                                    req.u.cmd_set_radio.subch);
                         t->update_radiotap_header(radiotap_header);
                     }
                     catch(runtime_error &e)
@@ -915,14 +916,15 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                     }
 
                     sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-                    WFB_INFO("Radiotap updated with stbc=%d, ldpc=%d, short_gi=%d, bandwidth=%d, mcs_index=%d, vht_mode=%d, vht_nss=%d\n",
+                    WFB_INFO("Radiotap updated with stbc=%d, ldpc=%d, short_gi=%d, bandwidth=%d, mcs_index=%d, vht_mode=%d, vht_nss=%d, subch=%d\n",
                             req.u.cmd_set_radio.stbc,
                             req.u.cmd_set_radio.ldpc,
                             req.u.cmd_set_radio.short_gi,
                             req.u.cmd_set_radio.bandwidth,
                             req.u.cmd_set_radio.mcs_index,
                             req.u.cmd_set_radio.vht_mode,
-                            req.u.cmd_set_radio.vht_nss);
+                            req.u.cmd_set_radio.vht_nss,
+                            req.u.cmd_set_radio.subch);
                 }
                 break;
 
@@ -964,6 +966,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                     resp.u.cmd_get_radio.mcs_index = hdr.mcs_index;
                     resp.u.cmd_get_radio.vht_mode = hdr.vht_mode;
                     resp.u.cmd_get_radio.vht_nss = hdr.vht_nss;
+                    resp.u.cmd_get_radio.subch = hdr.subch;
 
                     sendto(fd, &resp, offsetof(cmd_resp_t, u) + sizeof(resp.u.cmd_get_radio), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
                 }
@@ -1089,125 +1092,6 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
             fec_close_ts = get_time_ms() + fec_timeout;
         }
     }
-}
-
-
-radiotap_header_t init_radiotap_header(uint8_t stbc,
-                                       bool ldpc,
-                                       bool short_gi,
-                                       uint8_t bandwidth,
-                                       uint8_t mcs_index,
-                                       bool vht_mode,
-                                       uint8_t vht_nss)
-{
-    radiotap_header_t res = {
-        .header = {},
-        .stbc = stbc,
-        .ldpc = ldpc,
-        .short_gi = short_gi,
-        .bandwidth = bandwidth,
-        .mcs_index = mcs_index,
-        .vht_mode = vht_mode,
-        .vht_nss = vht_nss,
-    };
-
-    if (!vht_mode)
-    {
-        // Set flags in HT radiotap header
-        uint8_t flags = 0;
-
-        switch(bandwidth)
-        {
-        case 10:
-        case 20:
-            flags |= IEEE80211_RADIOTAP_MCS_BW_20;
-            break;
-        case 40:
-            flags |= IEEE80211_RADIOTAP_MCS_BW_40;
-            break;
-        default:
-            throw runtime_error(string_format("Unsupported HT bandwidth: %d", bandwidth));
-        }
-
-        if (short_gi)
-        {
-            flags |= IEEE80211_RADIOTAP_MCS_SGI;
-        }
-
-        switch(stbc)
-        {
-        case 0:
-            break;
-        case 1:
-            flags |= (IEEE80211_RADIOTAP_MCS_STBC_1 << IEEE80211_RADIOTAP_MCS_STBC_SHIFT);
-            break;
-        case 2:
-            flags |= (IEEE80211_RADIOTAP_MCS_STBC_2 << IEEE80211_RADIOTAP_MCS_STBC_SHIFT);
-            break;
-        case 3:
-            flags |= (IEEE80211_RADIOTAP_MCS_STBC_3 << IEEE80211_RADIOTAP_MCS_STBC_SHIFT);
-            break;
-        default:
-            throw runtime_error(string_format("Unsupported HT STBC type: %d", stbc));
-        }
-
-        if (ldpc)
-        {
-            flags |= IEEE80211_RADIOTAP_MCS_FEC_LDPC;
-        }
-
-        copy(radiotap_header_ht, radiotap_header_ht + sizeof(radiotap_header_ht), back_inserter(res.header));
-
-        res.header[MCS_FLAGS_OFF] = flags;
-        res.header[MCS_IDX_OFF] = mcs_index;
-    }
-    else
-    {
-        // Set flags in VHT radiotap header
-        uint8_t flags = 0;
-
-        copy(radiotap_header_vht, radiotap_header_vht + sizeof(radiotap_header_vht), back_inserter(res.header));
-
-        if (short_gi)
-        {
-            flags |= IEEE80211_RADIOTAP_VHT_FLAG_SGI;
-        }
-
-        if (stbc)
-        {
-            flags |= IEEE80211_RADIOTAP_VHT_FLAG_STBC;
-        }
-
-        switch(bandwidth)
-        {
-        case 10:
-        case 20:
-            res.header[VHT_BW_OFF] = IEEE80211_RADIOTAP_VHT_BW_20M;
-            break;
-        case 40:
-            res.header[VHT_BW_OFF] = IEEE80211_RADIOTAP_VHT_BW_40M;
-            break;
-        case 80:
-            res.header[VHT_BW_OFF] = IEEE80211_RADIOTAP_VHT_BW_80M;
-            break;
-        case 160:
-            res.header[VHT_BW_OFF] = IEEE80211_RADIOTAP_VHT_BW_160M;
-            break;
-        default:
-            throw runtime_error(string_format("Unsupported VHT bandwidth: %d", bandwidth));
-        }
-
-        if (ldpc)
-        {
-            res.header[VHT_CODING_OFF] = IEEE80211_RADIOTAP_VHT_CODING_LDPC_USER0;
-        }
-
-        res.header[VHT_FLAGS_OFF] = flags;
-        res.header[VHT_MCSNSS0_OFF] |= ((mcs_index << IEEE80211_RADIOTAP_VHT_MCS_SHIFT) & IEEE80211_RADIOTAP_VHT_MCS_MASK);
-        res.header[VHT_MCSNSS0_OFF] |= ((vht_nss << IEEE80211_RADIOTAP_VHT_NSS_SHIFT) & IEEE80211_RADIOTAP_VHT_NSS_MASK);
-    }
-
-    return res;
 }
 
 
@@ -1692,6 +1576,7 @@ int main(int argc, char * const *argv)
     int ldpc = 0;
     int mcs_index = 1;
     int vht_nss = 1;
+    int subch = SUBCH_NONE;
     int debug_port = 0;
     int fec_timeout = 0;
     int rcv_buf = 0;
@@ -1707,7 +1592,7 @@ int main(int argc, char * const *argv)
     uint32_t inject_retries = 0;
     uint32_t inject_retry_delay = 5000; // 5ms
 
-    while ((opt = getopt(argc, argv, "dI:K:k:n:u:U:p:F:l:B:G:S:L:M:N:D:T:i:e:R:s:f:mVQP:C:J:E:")) != -1) {
+    while ((opt = getopt(argc, argv, "dI:K:k:n:u:U:p:F:l:B:G:S:L:M:N:b:D:T:i:e:R:s:f:mVQP:C:J:E:")) != -1) {
         switch (opt) {
         case 'I':
             tx_mode = INJECTOR;
@@ -1764,6 +1649,9 @@ int main(int argc, char * const *argv)
             break;
         case 'N':
             vht_nss = atoi(optarg);
+            break;
+        case 'b':
+            subch = atoi(optarg);
             break;
         case 'D':
             debug_port = atoi(optarg);
@@ -1828,19 +1716,20 @@ int main(int argc, char * const *argv)
         default: /* '?' */
         show_usage:
             WFB_INFO("Local TX: %s [-K tx_key] [-k RS_K] [-n RS_N] { [-u udp_port] | [-U unix_socket] } [-R rcv_buf] [-p radio_port]\n"
-                     "             [-F fec_delay] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS]\n"
+                     "             [-F fec_delay] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS] [-b subch]\n"
                      "             [-T fec_timeout] [-l log_interval] [-e epoch] [-i link_id] [-f { data | rts }] [-m] [-V] [-Q]\n"
                      "             [-P fwmark] [-J inject_retries] [-E inject_retry_delay] [-C control_port] interface1 [interface2] ...\n",
                     argv[0]);
             WFB_INFO("TX distributor: %s -d [-K tx_key] [-k RS_K] [-n RS_N] { [-u udp_port] | [-U unix_socket] } [-R rcv_buf] [-s snd_buf] [-p radio_port]\n"
-                     "                      [-F fec_delay] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS]\n"
+                     "                      [-F fec_delay] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS] [-b subch]\n"
                      "                      [-T fec_timeout] [-l log_interval] [-e epoch] [-i link_id] [-f { data | rts }] [-m] [-V] [-Q]\n"
                      "                      [-P fwmark] [-C control_port] host1:port1,port2,... [host2:port1,port2,...] ...\n",
                     argv[0]);
             WFB_INFO("TX injector: %s -I port [-Q] [-R rcv_buf] [-l log_interval] interface1 [interface2] ...\n",
                     argv[0]);
-            WFB_INFO("Default: K='%s', k=%d, n=%d, fec_delay=%u [us], udp_port=%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", bandwidth=%d guard_interval=%s stbc=%d ldpc=%d mcs_index=%d vht_nss=%d, vht_mode=%d, fec_timeout=%d, log_interval=%d, rcv_buf=system_default, snd_buf=system_default, frame_type=data, mirror=false, use_qdisc=false, fwmark=%u, control_port=%d, inject_retries=%u, inject_retry_delay=%u\n",
-                     keypair.c_str(), k, n, fec_delay, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, fec_timeout, log_interval, fwmark, control_port, inject_retries, inject_retry_delay);
+            WFB_INFO("Default: K='%s', k=%d, n=%d, fec_delay=%u [us], udp_port=%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", bandwidth=%d guard_interval=%s stbc=%d ldpc=%d mcs_index=%d vht_nss=%d, vht_mode=%d, subch=%d, fec_timeout=%d, log_interval=%d, rcv_buf=system_default, snd_buf=system_default, frame_type=data, mirror=false, use_qdisc=false, fwmark=%u, control_port=%d, inject_retries=%u, inject_retry_delay=%u\n",
+                     keypair.c_str(), k, n, fec_delay, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, subch, fec_timeout, log_interval, fwmark, control_port, inject_retries, inject_retry_delay);
+            WFB_INFO("Sub-channel: 0 - whole channel, 2/3 - 20 MHz halves of 40, 7..10 - 20 MHz quarters of 80 (lowest first)\n");
             WFB_INFO("Radio MTU: %lu\n", (unsigned long)MAX_PAYLOAD_SIZE);
             WFB_INFO("WFB-ng version %s, FEC: %s\n", WFB_VERSION, zfex_opt);
             WFB_INFO("WFB-ng home page: <http://wfb-ng.org>\n");
@@ -1875,7 +1764,7 @@ int main(int argc, char * const *argv)
 
     try
     {
-        auto radiotap_header = init_radiotap_header(stbc, ldpc, short_gi, bandwidth, mcs_index, vht_mode, vht_nss);
+        auto radiotap_header = init_radiotap_header(stbc, ldpc, short_gi, bandwidth, mcs_index, vht_mode, vht_nss, subch);
         uint32_t channel_id = (link_id << 8) + radio_port;
 
         switch(tx_mode)
