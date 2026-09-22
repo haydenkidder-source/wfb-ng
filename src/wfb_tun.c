@@ -27,6 +27,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -37,19 +38,11 @@
 // Must be equal to common.radio_mtu !
 #define MTU 1445
 #define PING_INTERVAL_MS 500
+#define MAX_CTL_PORTS 16
 
 static struct event_base *ev_base;
-static struct event *ev_ping;
 static struct event *ev_tun_read;
-static struct event *ev_tun_read_timeout;
-static struct event *ev_tun_write;
-static struct event *ev_socket_write;
-static struct event *ev_socket_read;
-
-struct sockaddr_in peer_addr;
-
-static int pkt_sem = 0;
-static unsigned int agg_timeout_ms = 5;
+static int tun_fd = -1;
 
 typedef struct
 {
@@ -69,6 +62,31 @@ typedef struct
 typedef struct {
     uint16_t packet_size;
 }  __attribute__ ((packed)) tun_packet_hdr_t;
+
+// One wfb_tx/wfb_rx pair. The data stream aggregates TUN packets into
+// batches, the control stream (babeld, liveness probes) sends every packet
+// at once so that it never waits behind data. The pair is reached over UDP
+// on localhost or over abstract unix datagram sockets (-U): no IP stack per
+// packet, no port to allocate.
+typedef struct {
+    const char *name;
+    int fd;
+    struct sockaddr_storage peer_addr;
+    socklen_t peer_len;
+    unsigned int agg_timeout_ms;   // 0: no aggregation
+    int pkt_sem;
+    struct event *ev_ping;
+    struct event *ev_agg_timeout;
+    struct event *ev_socket_read;
+    struct event *ev_tun_write;
+    in_packet_buffer_t in_buf;     // TUN -> socket
+    out_packet_buffer_t out_buf;   // socket -> TUN
+} stream_t;
+
+static stream_t data_stream = { .name = "data", .fd = -1 };
+static stream_t ctl_stream = { .name = "ctl", .fd = -1 };
+static uint16_t ctl_ports[MAX_CTL_PORTS];
+static int ctl_ports_count = 0;
 
 
 // Don't use possible C++ loggers
@@ -101,107 +119,80 @@ void event_sig_cb(evutil_socket_t sig, short flags, void *arg)
 
 void ev_ping_cb(evutil_socket_t fd, short flags, void *arg)
 {
-    assert(fd >= 0);
+    stream_t *s = arg;
+
     assert((EV_TIMEOUT & flags) != 0);
 
-    if(pkt_sem == 0)
+    if(s->pkt_sem == 0)
     {
-        WFB_DBG("send ping\n");
-        sendto(fd, "", 0, MSG_DONTWAIT, (struct sockaddr*)&peer_addr, sizeof(peer_addr));
+        WFB_DBG("%s: send ping\n", s->name);
+        sendto(s->fd, "", 0, MSG_DONTWAIT, (struct sockaddr*)&s->peer_addr, s->peer_len);
     }
 
-    if(pkt_sem > 0) pkt_sem--;
+    if(s->pkt_sem > 0) s->pkt_sem--;
 }
 
-void ev_tun_read_cb(evutil_socket_t fd, short flags, void *arg)
+// UDP destination port of an IPv4/IPv6 packet, 0 for anything else
+static uint16_t udp_dst_port(const uint8_t *pkt, size_t len)
 {
-    in_packet_buffer_t *buf = arg;
+    size_t off;
 
-    assert(buf != NULL);
-    assert((EV_TIMEOUT & flags) == 0);
-    assert((EV_READ & flags) != 0);
-    assert(ev_tun_read != NULL);
-    assert(ev_socket_write != NULL);
-    assert(buf->data_size < MTU);
+    if (len < 1) return 0;
 
-    bool is_new_buffer = (buf->data_size == 0);
-    int nread = read(fd,
-                     buf->data + buf->data_size + sizeof(tun_packet_hdr_t),
-                     MTU - sizeof(tun_packet_hdr_t));
-
-    if (nread <= 0)
+    switch (pkt[0] >> 4)
     {
-        // No data ready (EAGAIN), interrupted, or EOF: keep listening without
-        // touching the aggregation buffer instead of aborting.
-        if (nread < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
-        {
-            fprintf(stderr, "tun read error: %s\n", strerror(errno));
-        }
-        event_add(ev_tun_read, NULL);
-        return;
+    case 4:
+        off = (pkt[0] & 0x0f) * 4;
+        // not UDP or not the first fragment
+        if (len < 20 || pkt[9] != IPPROTO_UDP || (((pkt[6] & 0x1f) << 8) | pkt[7]) != 0) return 0;
+        break;
+
+    case 6:
+        off = 40;
+        // extension headers are not walked: babeld and probes have none
+        if (len < 40 || pkt[6] != IPPROTO_UDP) return 0;
+        break;
+
+    default:
+        return 0;
     }
 
-    assert(nread <= MTU - sizeof(tun_packet_hdr_t));
-
-    ((tun_packet_hdr_t*)(buf->data + buf->data_size))->packet_size = htons(nread);
-
-    buf->data_size += (sizeof(tun_packet_hdr_t) + nread);
-
-    if (buf->data_size <= MTU)
-    {
-        buf->batch_size = buf->data_size;
-    }
-
-    WFB_DBG("tun_read: packet_size=%d, batch_size=%zu, data_size=%zu\n", nread, buf->batch_size, buf->data_size);
-
-    if(buf->data_size >= MTU || agg_timeout_ms == 0)
-    {
-        // flush buffer
-        event_add(ev_socket_write, NULL);
-    }
-    else
-    {
-        // continue aggregation
-        event_add(ev_tun_read, NULL);
-
-        if(is_new_buffer && agg_timeout_ms > 0)
-        {
-            // Set aggregation timeout for new buffer
-            struct timeval tv = { .tv_sec = agg_timeout_ms / 1000,
-                                  .tv_usec = (agg_timeout_ms % 1000) * 1000 };
-            event_add(ev_tun_read_timeout, &tv);
-        }
-
-    }
+    if (len < off + 4) return 0;
+    return (pkt[off + 2] << 8) | pkt[off + 3];
 }
 
-void ev_socket_write_cb(evutil_socket_t fd, short flags, void *arg)
+static bool is_ctl_packet(const uint8_t *pkt, size_t len)
 {
-    in_packet_buffer_t *buf = arg;
+    uint16_t port = udp_dst_port(pkt, len);
 
-    assert(buf != NULL);
-    assert(ev_tun_read != NULL);
-    assert(ev_socket_write != NULL);
+    for (int i = 0; port != 0 && i < ctl_ports_count; i++)
+    {
+        if (ctl_ports[i] == port) return true;
+    }
+    return false;
+}
+
+static void stream_set_agg_timeout(stream_t *s)
+{
+    struct timeval tv = { .tv_sec = s->agg_timeout_ms / 1000,
+                          .tv_usec = (s->agg_timeout_ms % 1000) * 1000 };
+    event_add(s->ev_agg_timeout, &tv);
+}
+
+// Send the ready batch, keep the packet that did not fit as the next one
+static void stream_send_batch(stream_t *s)
+{
+    in_packet_buffer_t *buf = &s->in_buf;
+
+    assert(buf->batch_size > 0);
+    assert(buf->batch_size <= MTU);
 
     // reset ping semaphore
-    pkt_sem = 1;
+    s->pkt_sem = 1;
 
-    if(flags & EV_WRITE && agg_timeout_ms > 0)
-    {
-        // reset aggregation timer;
-        event_del(ev_tun_read_timeout);
-    }
+    sendto(s->fd, buf->data, buf->batch_size, MSG_DONTWAIT, (struct sockaddr*)&s->peer_addr, s->peer_len);
 
-    if(flags & EV_TIMEOUT)
-    {
-        assert((flags & EV_WRITE) == 0);
-        event_del(ev_tun_read);
-    }
-
-    assert(buf->batch_size <= MTU);
-    sendto(fd, buf->data, buf->batch_size, MSG_DONTWAIT, (struct sockaddr*)&peer_addr, sizeof(peer_addr));
-
-    WFB_DBG("socket_write: batch_size=%zu, data_size=%zu\n", buf->batch_size, buf->data_size);
+    WFB_DBG("%s: socket_write: batch_size=%zu, data_size=%zu\n", s->name, buf->batch_size, buf->data_size);
 
     if(buf->data_size > buf->batch_size)
     {
@@ -215,58 +206,129 @@ void ev_socket_write_cb(evutil_socket_t fd, short flags, void *arg)
     }
 
     assert(buf->data_size <= MTU);
+}
 
-    if(buf->data_size == MTU || (buf->data_size > 0 && agg_timeout_ms == 0))
+static void stream_push(stream_t *s, const uint8_t *pkt, size_t size)
+{
+    in_packet_buffer_t *buf = &s->in_buf;
+    bool is_new_buffer = (buf->data_size == 0);
+
+    assert(buf->data_size < MTU);
+    assert(size <= MTU - sizeof(tun_packet_hdr_t));
+
+    ((tun_packet_hdr_t*)(buf->data + buf->data_size))->packet_size = htons(size);
+    memcpy(buf->data + buf->data_size + sizeof(tun_packet_hdr_t), pkt, size);
+    buf->data_size += (sizeof(tun_packet_hdr_t) + size);
+
+    if (buf->data_size <= MTU)
     {
-        event_add(ev_socket_write, NULL);
+        buf->batch_size = buf->data_size;
+    }
+
+    WFB_DBG("%s: tun_read: packet_size=%zu, batch_size=%zu, data_size=%zu\n", s->name, size, buf->batch_size, buf->data_size);
+
+    if(buf->data_size < MTU && s->agg_timeout_ms > 0)
+    {
+        // continue aggregation
+        if(is_new_buffer)
+        {
+            stream_set_agg_timeout(s);
+        }
+        return;
+    }
+
+    if(s->agg_timeout_ms > 0)
+    {
+        event_del(s->ev_agg_timeout);
+    }
+
+    stream_send_batch(s);
+
+    if(buf->data_size == MTU)
+    {
+        stream_send_batch(s);
+    }
+    else if(buf->data_size > 0)
+    {
+        stream_set_agg_timeout(s);
+    }
+}
+
+void ev_agg_timeout_cb(evutil_socket_t fd, short flags, void *arg)
+{
+    stream_t *s = arg;
+
+    assert((EV_TIMEOUT & flags) != 0);
+
+    if(s->in_buf.batch_size > 0)
+    {
+        stream_send_batch(s);
+    }
+
+    if(s->in_buf.data_size > 0)
+    {
+        stream_set_agg_timeout(s);
+    }
+}
+
+void ev_tun_read_cb(evutil_socket_t fd, short flags, void *arg)
+{
+    uint8_t pkt[MTU];
+
+    assert((EV_READ & flags) != 0);
+
+    int nread = read(fd, pkt, MTU - sizeof(tun_packet_hdr_t));
+
+    if (nread <= 0)
+    {
+        // No data ready (EAGAIN), interrupted, or EOF: keep listening.
+        if (nread < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+        {
+            fprintf(stderr, "tun read error: %s\n", strerror(errno));
+        }
+        return;
+    }
+
+    if (ctl_stream.fd >= 0 && is_ctl_packet(pkt, nread))
+    {
+        stream_push(&ctl_stream, pkt, nread);
     }
     else
     {
-        event_add(ev_tun_read, NULL);
-
-        if(buf->data_size > 0 && agg_timeout_ms > 0)
-        {
-            // Set aggregation timeout for non-empty buffer
-            struct timeval tv = { .tv_sec = agg_timeout_ms / 1000,
-                                  .tv_usec = (agg_timeout_ms % 1000) * 1000 };
-
-            event_add(ev_tun_read_timeout, &tv);
-        }
+        stream_push(&data_stream, pkt, nread);
     }
 }
 
 
 void ev_tun_write_cb(evutil_socket_t fd, short flags, void *arg)
 {
-    out_packet_buffer_t *buf = arg;
+    stream_t *s = arg;
+    out_packet_buffer_t *buf = &s->out_buf;
     int nwrote;
 
-    assert(buf != NULL);
     assert((EV_TIMEOUT & flags) == 0);
     assert((EV_WRITE & flags) != 0);
-    assert(ev_tun_write != NULL);
-    assert(ev_socket_read != NULL);
 
     if (buf->offset + sizeof(tun_packet_hdr_t) > buf->data_size)
     {
         // Truncated/misframed batch from the peer: drop it and resume reading
         // instead of aborting the tunnel.
-        fprintf(stderr, "tun_write: truncated batch header, dropping\n");
+        fprintf(stderr, "%s: tun_write: truncated batch header, dropping\n", s->name);
         memset(buf, 0, sizeof(out_packet_buffer_t));
-        event_add(ev_socket_read, NULL);
+        event_add(s->ev_socket_read, NULL);
         return;
     }
 
     uint16_t packet_size = ntohs(((tun_packet_hdr_t*)(buf->data + buf->offset))->packet_size);
 
-    WFB_DBG("tun_write: off=%zu, psize=%zu + %d, data_size=%zu\n", buf->offset, sizeof(tun_packet_hdr_t), packet_size, buf->data_size);
+    WFB_DBG("%s: tun_write: off=%zu, psize=%zu + %d, data_size=%zu\n", s->name, buf->offset, sizeof(tun_packet_hdr_t), packet_size, buf->data_size);
 
     if (buf->offset + sizeof(tun_packet_hdr_t) + packet_size > buf->data_size)
     {
         // Framed length runs past the received batch: drop and resume reading.
-        fprintf(stderr, "tun_write: framed packet_size overruns batch, dropping\n");
+        fprintf(stderr, "%s: tun_write: framed packet_size overruns batch, dropping\n", s->name);
         memset(buf, 0, sizeof(out_packet_buffer_t));
-        event_add(ev_socket_read, NULL);
+        event_add(s->ev_socket_read, NULL);
         return;
     }
 
@@ -278,14 +340,14 @@ void ev_tun_write_cb(evutil_socket_t fd, short flags, void *arg)
         {
             // TUN queue full: retry this same packet once the device is writable
             // again (offset is not advanced).
-            event_add(ev_tun_write, NULL);
+            event_add(s->ev_tun_write, NULL);
             return;
         }
 
         // Hard error or short write: drop the rest of the batch and resume reading.
-        fprintf(stderr, "tun write error (%d/%u): %s\n", nwrote, packet_size, strerror(errno));
+        fprintf(stderr, "%s: tun write error (%d/%u): %s\n", s->name, nwrote, packet_size, strerror(errno));
         memset(buf, 0, sizeof(out_packet_buffer_t));
-        event_add(ev_socket_read, NULL);
+        event_add(s->ev_socket_read, NULL);
         return;
     }
 
@@ -293,26 +355,24 @@ void ev_tun_write_cb(evutil_socket_t fd, short flags, void *arg)
 
     if (buf->offset < buf->data_size)
     {
-        event_add(ev_tun_write, NULL);
+        event_add(s->ev_tun_write, NULL);
     }
     else
     {
         memset(buf, 0, sizeof(out_packet_buffer_t));
-        event_add(ev_socket_read, NULL);
+        event_add(s->ev_socket_read, NULL);
     }
 }
 
 
 void ev_socket_read_cb(evutil_socket_t fd, short flags, void *arg)
 {
-    out_packet_buffer_t *buf = arg;
+    stream_t *s = arg;
+    out_packet_buffer_t *buf = &s->out_buf;
     int nread;
 
-    assert(buf != NULL);
     assert((EV_TIMEOUT & flags) == 0);
     assert((EV_READ & flags) != 0);
-    assert(ev_socket_read != NULL);
-    assert(ev_tun_write != NULL);
 
     nread = recv(fd,
                  buf->data,
@@ -324,9 +384,9 @@ void ev_socket_read_cb(evutil_socket_t fd, short flags, void *arg)
         // No datagram ready (EAGAIN) or interrupted: keep listening.
         if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
         {
-            fprintf(stderr, "socket recv error: %s\n", strerror(errno));
+            fprintf(stderr, "%s: socket recv error: %s\n", s->name, strerror(errno));
         }
-        event_add(ev_socket_read, NULL);
+        event_add(s->ev_socket_read, NULL);
         return;
     }
 
@@ -335,17 +395,17 @@ void ev_socket_read_cb(evutil_socket_t fd, short flags, void *arg)
     if(nread == 0)
     {
         // skip ping packet
-        event_add (ev_socket_read, NULL);
-        WFB_DBG("got ping\n");
+        event_add (s->ev_socket_read, NULL);
+        WFB_DBG("%s: got ping\n", s->name);
         return;
     }
 
     buf->offset = 0;
     buf->data_size = nread;
 
-    WFB_DBG("socket_read: off=%zu, data_size=%zu\n", buf->offset, buf->data_size);
+    WFB_DBG("%s: socket_read: off=%zu, data_size=%zu\n", s->name, buf->offset, buf->data_size);
 
-    event_add(ev_tun_write, NULL);
+    event_add(s->ev_tun_write, NULL);
 }
 
 static int open_tun(char *dev, char *dev_addr)
@@ -438,38 +498,134 @@ static int create_udpsock(uint16_t bind_port)
 }
 
 
+// Abstract unix socket address "@name": nothing on the filesystem
+static socklen_t unix_addr(struct sockaddr_un *sa, const char *name)
+{
+    memset(sa, 0, sizeof(*sa));
+    sa->sun_family = AF_UNIX;
+    strncpy(sa->sun_path + 1, name, sizeof(sa->sun_path) - 2);
+    return sizeof(sa_family_t) + 1 + strlen(sa->sun_path + 1);
+}
+
+
+static int create_unixsock(const char *bind_name)
+{
+    int fd;
+    struct sockaddr_un saddr;
+    socklen_t len = unix_addr(&saddr, bind_name);
+
+    if((fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)) < 0)
+    {
+        perror("socket");
+        return -1;
+    }
+
+    if(bind(fd, (const struct sockaddr *) &saddr, len) < 0)
+    {
+        perror("bind");
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+
+static int stream_start(stream_t *s, int fd, const struct sockaddr *peer, socklen_t peer_len, unsigned int agg_timeout_ms)
+{
+    struct timeval ping_tv = { .tv_sec = PING_INTERVAL_MS / 1000,
+                               .tv_usec = (PING_INTERVAL_MS % 1000) * 1000 };
+
+    if (fd < 0) return -1;
+    s->fd = fd;
+
+    memset(&s->peer_addr, 0, sizeof(s->peer_addr));
+    memcpy(&s->peer_addr, peer, peer_len);
+    s->peer_len = peer_len;
+    s->agg_timeout_ms = agg_timeout_ms;
+
+    s->ev_ping = event_new(ev_base, -1, EV_PERSIST, &ev_ping_cb, s);
+    s->ev_agg_timeout = event_new(ev_base, -1, EV_TIMEOUT, &ev_agg_timeout_cb, s);
+    s->ev_socket_read = event_new(ev_base, s->fd, EV_READ, &ev_socket_read_cb, s);
+    s->ev_tun_write = event_new(ev_base, tun_fd, EV_WRITE, &ev_tun_write_cb, s);
+
+    assert(s->ev_ping != NULL);
+    assert(s->ev_agg_timeout != NULL);
+    assert(s->ev_socket_read != NULL);
+    assert(s->ev_tun_write != NULL);
+
+    event_add(s->ev_ping, &ping_tv);
+    event_add(s->ev_socket_read, NULL);
+    return 0;
+}
+
+static int stream_start_udp(stream_t *s, uint16_t bind_port, struct in_addr peer_ip, uint16_t peer_port, unsigned int agg_timeout_ms)
+{
+    struct sockaddr_in peer;
+
+    memset(&peer, 0, sizeof(peer));
+    peer.sin_family = AF_INET;
+    peer.sin_addr = peer_ip;
+    peer.sin_port = htons(peer_port);
+    return stream_start(s, create_udpsock(bind_port), (struct sockaddr*)&peer, sizeof(peer), agg_timeout_ms);
+}
+
+// The stream listens on "@<prefix>.<stream>.in" (wfb_rx -U sends there) and
+// sends to "@<prefix>.<stream>.out" (wfb_tx -U listens there)
+static int stream_start_unix(stream_t *s, const char *prefix, unsigned int agg_timeout_ms)
+{
+    char name[sizeof(((struct sockaddr_un*)0)->sun_path)];
+    struct sockaddr_un peer;
+    socklen_t len;
+    int fd;
+
+    snprintf(name, sizeof(name), "%s.%s.in", prefix, s->name);
+    fd = create_unixsock(name);
+    snprintf(name, sizeof(name), "%s.%s.out", prefix, s->name);
+    len = unix_addr(&peer, name);
+    return stream_start(s, fd, (struct sockaddr*)&peer, len, agg_timeout_ms);
+}
+
+static void stream_stop(stream_t *s)
+{
+    if (s->fd < 0) return;
+    close(s->fd);
+    event_free(s->ev_ping);
+    event_free(s->ev_agg_timeout);
+    event_free(s->ev_socket_read);
+    event_free(s->ev_tun_write);
+}
+
+static int parse_ctl_ports(char *list)
+{
+    for (char *p = strtok(list, ","); p != NULL; p = strtok(NULL, ","))
+    {
+        int port = atoi(p);
+        if (port <= 0 || port > 65535 || ctl_ports_count >= MAX_CTL_PORTS) return -1;
+        ctl_ports[ctl_ports_count++] = port;
+    }
+    return 0;
+}
+
+
 int main (int argc, char *argv[])
 {
     struct event_config *ev_cfg = NULL;
     struct event *ev_sigint = NULL;
     struct event *ev_sigterm = NULL;
 
-    struct timeval ping_tv = { .tv_sec = PING_INTERVAL_MS / 1000,
-                               .tv_usec = (PING_INTERVAL_MS % 1000) * 1000 };
-
-    int tun_fd = -1;
-    int sock_fd = -1;
-
-    // buffer TUN -> socket
-    in_packet_buffer_t in_buf;
-
-    // buffer socket -> TUN
-    out_packet_buffer_t out_buf;
-
     uint16_t bind_port = 5800;
+    uint16_t peer_port = 5801;
+    int ctl_bind_port = 0;
+    int ctl_peer_port = 0;
+    unsigned int agg_timeout_ms = 5;
+    struct in_addr peer_ip = { .s_addr = htonl(0x7f000001) }; // 127.0.0.1
+    char *unix_prefix = NULL;
     char *tun_name = "wfb-tun";
     char *tun_addr = "10.5.0.2/24";
     int opt;
 
-    memset(&in_buf, 0, sizeof(in_buf));
-    memset(&out_buf, 0, sizeof(out_buf));
-
-    memset(&peer_addr, 0, sizeof(peer_addr));
-    peer_addr.sin_family = AF_INET;
-    peer_addr.sin_addr.s_addr = htonl(0x7f000001); // 127.0.0.1
-    peer_addr.sin_port = htons(5801);
-
-    while ((opt = getopt(argc, argv, "t:c:u:l:a:T:h")) != -1)
+    while ((opt = getopt(argc, argv, "t:c:u:l:a:T:C:L:F:U:h")) != -1)
     {
         switch (opt)
         {
@@ -486,7 +642,7 @@ int main (int argc, char *argv[])
             break;
 
         case 'c':
-            if(inet_pton(AF_INET, optarg, &peer_addr.sin_addr) != 1)
+            if(inet_pton(AF_INET, optarg, &peer_ip) != 1)
             {
                 perror("invalid address");
                 return 1;
@@ -494,20 +650,50 @@ int main (int argc, char *argv[])
             break;
 
         case 'u':
-            peer_addr.sin_port = htons(atoi(optarg));
+            peer_port = atoi(optarg);
             break;
 
         case 'l':
             bind_port = atoi(optarg);
             break;
 
+        case 'C':
+            ctl_peer_port = atoi(optarg);
+            break;
+
+        case 'L':
+            ctl_bind_port = atoi(optarg);
+            break;
+
+        case 'F':
+            if (parse_ctl_ports(optarg) < 0)
+            {
+                fprintf(stderr, "invalid control port list: %s\n", optarg);
+                return 1;
+            }
+            break;
+
+        case 'U':
+            unix_prefix = strdup(optarg);
+            break;
+
         default: /* '?' */
-            fprintf(stderr, "Usage: %s [-t tun_name] [-a tun_addr] [-c peer_addr] [-u peer_port] [-l listen_port] [-T agg_timeout_ms] \n", argv[0]);
-            fprintf(stderr, "Default: tun_name=%s, tun_addr=%s, peer_addr=127.0.0.1, peer_port=5801, listen_port=%d, agg_timeout_ms=%u\n", tun_name, tun_addr, bind_port, agg_timeout_ms);
+            fprintf(stderr, "Usage: %s [-t tun_name] [-a tun_addr] [-T agg_timeout_ms] [-F udp_port,...]\n"
+                            "          { [-c peer_addr] [-u peer_port] [-l listen_port] [-C ctl_peer_port -L ctl_listen_port] | -U unix_prefix }\n", argv[0]);
+            fprintf(stderr, "Default: tun_name=%s, tun_addr=%s, peer_addr=127.0.0.1, peer_port=%d, listen_port=%d, agg_timeout_ms=%u\n", tun_name, tun_addr, peer_port, bind_port, agg_timeout_ms);
+            fprintf(stderr, "Control stream: packets to the listed UDP destination ports go to ctl_peer_port one by one, without aggregation\n");
+            fprintf(stderr, "-U: abstract unix sockets instead of UDP: wfb_rx -U <prefix>.data.in, wfb_tx -U <prefix>.data.out,\n"
+                            "    with -F also <prefix>.ctl.in and <prefix>.ctl.out; raise net.unix.max_dgram_qlen (10 by default)\n");
             fprintf(stderr, "WFB-ng version %s\n", WFB_VERSION);
             fprintf(stderr, "WFB-ng home page: <http://wfb-ng.org>\n");
             return 1;
         }
+    }
+
+    if (unix_prefix == NULL && (ctl_peer_port != 0) != (ctl_bind_port != 0))
+    {
+        fprintf(stderr, "-C and -L go together\n");
+        return 1;
     }
 
     // initialize libevent
@@ -532,58 +718,33 @@ int main (int argc, char *argv[])
     ev_sigterm = evsignal_new(ev_base, SIGTERM, &event_sig_cb, NULL);
     evsignal_add(ev_sigterm, NULL);
 
-    sock_fd = create_udpsock(bind_port);
-    assert(sock_fd >= 0);
-
     tun_fd = open_tun(tun_name, tun_addr);
     assert(tun_fd >= 0);
 
-    ev_ping = event_new(ev_base, sock_fd, EV_PERSIST, &ev_ping_cb, NULL);
-    event_add(ev_ping, &ping_tv);
+    if (unix_prefix != NULL)
+    {
+        if (stream_start_unix(&data_stream, unix_prefix, agg_timeout_ms) < 0) return 1;
+        if (ctl_ports_count > 0 && stream_start_unix(&ctl_stream, unix_prefix, 0) < 0) return 1;
+    }
+    else
+    {
+        if (stream_start_udp(&data_stream, bind_port, peer_ip, peer_port, agg_timeout_ms) < 0) return 1;
+        if (ctl_peer_port != 0 && stream_start_udp(&ctl_stream, ctl_bind_port, peer_ip, ctl_peer_port, 0) < 0) return 1;
+    }
 
-    ev_tun_read = event_new(ev_base,
-                            tun_fd,
-                            EV_READ,
-                            &ev_tun_read_cb, &in_buf);
-
-    ev_tun_read_timeout = event_new(ev_base,
-                                    sock_fd,
-                                    EV_TIMEOUT,
-                                    &ev_socket_write_cb, &in_buf);
-
-    ev_socket_read = event_new(ev_base,
-                               sock_fd,
-                               EV_READ,
-                               &ev_socket_read_cb, &out_buf);
-
-    ev_tun_write = event_new(ev_base,
-                             tun_fd,
-                             EV_WRITE,
-                             &ev_tun_write_cb, &out_buf);
-
-    ev_socket_write = event_new(ev_base,
-                                sock_fd,
-                                EV_WRITE,
-                                &ev_socket_write_cb, &in_buf);
-
+    ev_tun_read = event_new(ev_base, tun_fd, EV_READ | EV_PERSIST, &ev_tun_read_cb, NULL);
     assert(ev_tun_read != NULL);
-    assert(ev_socket_read != NULL);
-
     event_add(ev_tun_read, NULL);
-    event_add(ev_socket_read, NULL);
+
     event_base_dispatch(ev_base);
 
-    close(sock_fd);
+    stream_stop(&ctl_stream);
+    stream_stop(&data_stream);
     close(tun_fd);
 
     if(ev_sigint) event_free(ev_sigint);
     if(ev_sigterm) event_free(ev_sigterm);
     if(ev_tun_read) event_free(ev_tun_read);
-    if(ev_tun_read_timeout) event_free(ev_tun_read_timeout);
-    if(ev_tun_write) event_free(ev_tun_write);
-    if(ev_socket_read) event_free(ev_socket_read);
-    if(ev_socket_write) event_free(ev_socket_write);
-    if(ev_ping) event_free(ev_ping);
 
     event_base_free (ev_base);
     event_config_free (ev_cfg);
