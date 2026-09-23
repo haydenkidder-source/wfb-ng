@@ -22,6 +22,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/un.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <time.h>
@@ -31,6 +32,9 @@
 
 #define COMMAND_TIMEOUT  3  //[seconds]
 
+// -U: the control socket of wfb_tx is an abstract unix socket instead of a UDP port
+static const char *unix_socket = NULL;
+
 void alarm_handler(int signum)
 {
     char *msg = "Command timed out!\n";
@@ -39,27 +43,72 @@ void alarm_handler(int signum)
     _exit(1);
 }
 
-int send_command(int port, cmd_req_t req, size_t req_size, cmd_resp_t *resp)
+static int open_unix_target(struct sockaddr_un *addr, socklen_t *addr_len)
 {
-    struct sockaddr_in addr;
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    size_t resp_payload_size = 0;
+    struct sockaddr_un me;
+    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
 
     if (fd < 0)
     {
         perror("socket");
-        return 1;
+        return -1;
     }
 
-    memset(&addr, '\0', sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = htonl(0x7f000001); // 127.0.0.1
+    // the reply needs a sender address: an abstract name of our own
+    memset(&me, '\0', sizeof(me));
+    me.sun_family = AF_UNIX;
+    snprintf(me.sun_path + 1, sizeof(me.sun_path) - 1, "wfb_tx_cmd.%d", getpid());
+
+    if (bind(fd, (struct sockaddr *)&me, sizeof(sa_family_t) + 1 + strlen(me.sun_path + 1)) < 0)
+    {
+        perror("bind");
+        close(fd);
+        return -1;
+    }
+
+    memset(addr, '\0', sizeof(*addr));
+    addr->sun_family = AF_UNIX;
+    strncpy(addr->sun_path + 1, unix_socket, sizeof(addr->sun_path) - 2);
+    *addr_len = sizeof(sa_family_t) + 1 + strlen(addr->sun_path + 1);
+    return fd;
+}
+
+
+int send_command(int port, cmd_req_t req, size_t req_size, cmd_resp_t *resp)
+{
+    struct sockaddr_in addr;
+    struct sockaddr_un uaddr;
+    struct sockaddr *to = (struct sockaddr *)&addr;
+    socklen_t to_len = sizeof(addr);
+    int fd;
+    size_t resp_payload_size = 0;
+
+    if (unix_socket != NULL)
+    {
+        fd = open_unix_target(&uaddr, &to_len);
+        if (fd < 0) return 1;
+        to = (struct sockaddr *)&uaddr;
+    }
+    else
+    {
+        fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+        if (fd < 0)
+        {
+            perror("socket");
+            return 1;
+        }
+
+        memset(&addr, '\0', sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr.s_addr = htonl(0x7f000001); // 127.0.0.1
+    }
 
     // Exit with error code in case of any timeout
     alarm(COMMAND_TIMEOUT);
 
-    int psize = sendto(fd, &req, req_size, 0, (struct sockaddr *)&addr, sizeof(addr));
+    int psize = sendto(fd, &req, req_size, 0, to, to_len);
     if (psize < 0)
     {
         perror("sendto");
@@ -138,7 +187,7 @@ int set_fec(char *progname, int port, int argc, char **argv)
             break;
 
         default: /* '?' */
-            fprintf(stderr, "Usage: %s <port> %s [-k RS_K] [-n RS_N]\n", progname, argv[0]);
+            fprintf(stderr, "Usage: %s { port | -U unix_socket } %s [-k RS_K] [-n RS_N]\n", progname, argv[0]);
             fprintf(stderr, "Default: k=%d, n=%d\n", k, n);
             fprintf(stderr, "WFB-ng version %s\n", WFB_VERSION);
             fprintf(stderr, "WFB-ng home page: <http://wfb-ng.org>\n");
@@ -207,7 +256,7 @@ int set_radio(char *progname, int port, int argc, char **argv)
             break;
 
         default: /* '?' */
-            fprintf(stderr, "Usage: %s <port> %s [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS] [-b subch] [-V]\n",
+            fprintf(stderr, "Usage: %s { port | -U unix_socket } %s [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS] [-b subch] [-V]\n",
                     progname, argv[0]);
             fprintf(stderr, "Default: bandwidth=%d, guard_interval=%s, stbc=%d, ldpc=%d, mcs_index=%d, vht_nss=%d, vht_mode=%d, subch=%d\n",
                     bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, subch);
@@ -292,9 +341,18 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if (argc > 2 && strcmp(argv[1], "-U") == 0)
+    {
+        // the socket name takes the place of the port
+        unix_socket = argv[2];
+        argv[1] = argv[0];
+        argv += 1;
+        argc -= 1;
+    }
+
     if (argc < 3)
     {
-        fprintf(stderr, "Usage: %s <port> {set_fec | set_radio | get_fec | get_radio } ...\n", argv[0]);
+        fprintf(stderr, "Usage: %s { port | -U unix_socket } {set_fec | set_radio | get_fec | get_radio } ...\n", argv[0]);
         fprintf(stderr, "WFB-ng version %s\n", WFB_VERSION);
         fprintf(stderr, "WFB-ng home page: <http://wfb-ng.org>\n");
         return 1;

@@ -497,17 +497,17 @@ class UNIXTXRXTestCase(TXRXTestCase):
         self.tx_rx_ep = reactor.listenUNIXDatagram(None, self.txp_rxp)
         self.txp = UDP_TXRX('\0wfb-tx-test', self.txp_rxp)
 
-        self.cmdp = TXCommandClient(('127.0.0.1', 7003))
+        self.cmdp = TXCommandClient(b'\0wfb-tx-cmd-test')
 
         self.rx_ep = reactor.listenUNIXDatagram(b'\0wfb-rx-test', self.rxp)
         self.tx_ep = reactor.listenUDP(10004, self.txp)
-        self.cmd_ep = reactor.listenUDP(0, self.cmdp)
+        self.cmd_ep = reactor.listenUNIXDatagram(b'\0wfb-cmd-client-test', self.cmdp)
 
         link_id = int.from_bytes(os.urandom(3), 'big')
         epoch = int(time.time())
         cmd_rx = [os.path.join(bindir, 'wfb_rx'), '-K', 'drone.key', '-a', '10001', '-U', 'wfb-rx-test',
                   '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
-        cmd_tx = [os.path.join(bindir, 'wfb_tx'), '-K', 'gs.key', '-U', 'wfb-tx-test', '-D', '10004', '-T', '30', '-F', '3000', '-C', '7003',
+        cmd_tx = [os.path.join(bindir, 'wfb_tx'), '-K', 'gs.key', '-U', 'wfb-tx-test', '-D', '10004', '-T', '30', '-F', '3000', '-c', 'wfb-tx-cmd-test',
                   # '-Q', '-P 1',  ## requires root priv
                   '-i', str(link_id), '-e', str(epoch), '-R', str(512 * 1024), '-s', str(512 * 1024), 'wlan0']
 

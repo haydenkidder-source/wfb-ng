@@ -834,7 +834,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                 cmd_req_t req = {};
                 cmd_resp_t resp = {};
                 ssize_t rsize;
-                struct sockaddr_in from_addr;
+                struct sockaddr_storage from_addr;      // UDP or unix
                 socklen_t addr_size = sizeof(from_addr);
 
                 if ((rsize = recvfrom(fd, &req, sizeof(req), MSG_DONTWAIT, (sockaddr*)&from_addr, &addr_size )) < 0 || addr_size > sizeof(from_addr))
@@ -1287,8 +1287,15 @@ void injector_loop(int argc, char* const* argv, int optind, int srv_port, int rc
 }
 
 
-int open_control_fd(int control_port)
+int open_control_fd(int control_port, const char *control_unix)
 {
+    if (control_unix != NULL)
+    {
+        int control_fd = open_unix_socket_for_rx(control_unix, 0, SOCK_DGRAM);
+        WFB_INFO("Listen on @%s for management commands\n", control_unix);
+        return control_fd;
+    }
+
     int control_fd = open_udp_socket_for_rx(control_port, 0, 0x7f000001);  // bind to 127.0.0.1 for security reasons
 
     if (control_port == 0)
@@ -1311,7 +1318,7 @@ int open_control_fd(int control_port)
 void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int log_interval,
                     int udp_port, int debug_port, int k, int n, const string &keypair, int fec_timeout,
                     uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
-                    radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
+                    radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, const char *control_unix, bool mirror,
                     int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay)
 {
     vector<int> rx_fd;
@@ -1366,14 +1373,14 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
                                                                       inject_retries, inject_retry_delay));
     }
 
-    int control_fd = open_control_fd(control_port);
+    int control_fd = open_control_fd(control_port, control_unix);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 }
 
 void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int log_interval,
                      const char *unix_socket, int debug_port, int k, int n, const string &keypair, int fec_timeout,
                      uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
-                     radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
+                     radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, const char *control_unix, bool mirror,
                      int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay)
 {
     vector<int> rx_fd;
@@ -1415,7 +1422,7 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
                                                                       inject_retries, inject_retry_delay));
     }
 
-    int control_fd = open_control_fd(control_port);
+    int control_fd = open_control_fd(control_port, control_unix);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 }
 
@@ -1423,7 +1430,7 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
 void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int log_interval,
                       int udp_port, int k, int n, const string &keypair, int fec_timeout,
                       uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
-                      radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
+                      radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, const char *control_unix, bool mirror,
                       int snd_buf_size)
 {
     vector<int> rx_fd;
@@ -1491,7 +1498,7 @@ void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int 
                                                                                     remote_hosts, radiotap_header, frame_type, use_qdisc,
                                                                                     fwmark, snd_buf_size));
 
-    int control_fd = open_control_fd(control_port);
+    int control_fd = open_control_fd(control_port, control_unix);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 }
 
@@ -1499,7 +1506,7 @@ void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int 
 void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int log_interval,
                            const char* unix_socket, int k, int n, const string &keypair, int fec_timeout,
                            uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
-                           radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
+                           radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, const char *control_unix, bool mirror,
                            int snd_buf_size)
 {
     vector<int> rx_fd;
@@ -1553,7 +1560,7 @@ void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf,
                                                                                     remote_hosts, radiotap_header, frame_type, use_qdisc,
                                                                                     fwmark, snd_buf_size));
 
-    int control_fd = open_control_fd(control_port);
+    int control_fd = open_control_fd(control_port, control_unix);
     data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 }
 
@@ -1568,6 +1575,7 @@ int main(int argc, char * const *argv)
     int srv_port = 10000;
     int udp_port=5600;
     int control_port=0;
+    char *control_unix = NULL;
     int log_interval = 1000;
 
     int bandwidth = 20;
@@ -1592,7 +1600,7 @@ int main(int argc, char * const *argv)
     uint32_t inject_retries = 0;
     uint32_t inject_retry_delay = 5000; // 5ms
 
-    while ((opt = getopt(argc, argv, "dI:K:k:n:u:U:p:F:l:B:G:S:L:M:N:b:D:T:i:e:R:s:f:mVQP:C:J:E:")) != -1) {
+    while ((opt = getopt(argc, argv, "dI:K:k:n:u:U:p:F:l:B:G:S:L:M:N:b:D:T:i:e:R:s:f:mVQP:C:c:J:E:")) != -1) {
         switch (opt) {
         case 'I':
             tx_mode = INJECTOR;
@@ -1705,6 +1713,10 @@ int main(int argc, char * const *argv)
             control_port = atoi(optarg);
             break;
 
+        case 'c':
+            control_unix = optarg;
+            break;
+
         case 'J':
             inject_retries = atoi(optarg);
             break;
@@ -1718,12 +1730,12 @@ int main(int argc, char * const *argv)
             WFB_INFO("Local TX: %s [-K tx_key] [-k RS_K] [-n RS_N] { [-u udp_port] | [-U unix_socket] } [-R rcv_buf] [-p radio_port]\n"
                      "             [-F fec_delay] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS] [-b subch]\n"
                      "             [-T fec_timeout] [-l log_interval] [-e epoch] [-i link_id] [-f { data | rts }] [-m] [-V] [-Q]\n"
-                     "             [-P fwmark] [-J inject_retries] [-E inject_retry_delay] [-C control_port] interface1 [interface2] ...\n",
+                     "             [-P fwmark] [-J inject_retries] [-E inject_retry_delay] [-C control_port] [-c control_unix_socket] interface1 [interface2] ...\n",
                     argv[0]);
             WFB_INFO("TX distributor: %s -d [-K tx_key] [-k RS_K] [-n RS_N] { [-u udp_port] | [-U unix_socket] } [-R rcv_buf] [-s snd_buf] [-p radio_port]\n"
                      "                      [-F fec_delay] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS] [-b subch]\n"
                      "                      [-T fec_timeout] [-l log_interval] [-e epoch] [-i link_id] [-f { data | rts }] [-m] [-V] [-Q]\n"
-                     "                      [-P fwmark] [-C control_port] host1:port1,port2,... [host2:port1,port2,...] ...\n",
+                     "                      [-P fwmark] [-C control_port] [-c control_unix_socket] host1:port1,port2,... [host2:port1,port2,...] ...\n",
                     argv[0]);
             WFB_INFO("TX injector: %s -I port [-Q] [-R rcv_buf] [-l log_interval] interface1 [interface2] ...\n",
                     argv[0]);
@@ -1779,7 +1791,7 @@ int main(int argc, char * const *argv)
                 local_loop_unix(argc, argv, optind, rcv_buf, log_interval,
                                 unix_socket, debug_port, k, n, keypair, fec_timeout,
                                 epoch, channel_id, fec_delay, use_qdisc, fwmark,
-                                radiotap_header, frame_type, control_port, mirror,
+                                radiotap_header, frame_type, control_port, control_unix, mirror,
                                 snd_buf, inject_retries, inject_retry_delay);
             }
             else
@@ -1787,7 +1799,7 @@ int main(int argc, char * const *argv)
                 local_loop_udp(argc, argv, optind, rcv_buf, log_interval,
                                udp_port, debug_port, k, n, keypair, fec_timeout,
                                epoch, channel_id, fec_delay, use_qdisc, fwmark,
-                               radiotap_header, frame_type, control_port, mirror,
+                               radiotap_header, frame_type, control_port, control_unix, mirror,
                                snd_buf, inject_retries, inject_retry_delay);
             }
             break;
@@ -1798,7 +1810,7 @@ int main(int argc, char * const *argv)
                 distributor_loop_unix(argc, argv, optind, rcv_buf, log_interval,
                                       unix_socket, k, n, keypair, fec_timeout,
                                       epoch, channel_id, fec_delay, use_qdisc, fwmark,
-                                      radiotap_header, frame_type, control_port, mirror,
+                                      radiotap_header, frame_type, control_port, control_unix, mirror,
                                       snd_buf);
             }
             else
@@ -1806,7 +1818,7 @@ int main(int argc, char * const *argv)
                 distributor_loop(argc, argv, optind, rcv_buf, log_interval,
                                  udp_port, k, n, keypair, fec_timeout,
                                  epoch, channel_id, fec_delay, use_qdisc, fwmark,
-                                 radiotap_header, frame_type, control_port, mirror,
+                                 radiotap_header, frame_type, control_port, control_unix, mirror,
                                  snd_buf);
             }
             break;
